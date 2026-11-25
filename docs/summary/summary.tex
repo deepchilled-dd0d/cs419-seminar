@@ -1,0 +1,311 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\usepackage[colorlinks=true]{hyperref}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\title{ColPali Summary}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction:}
+\subsection{Problem and Solution:}
+The authors identified two problems concerning the current document retrieval landscape:
+\begin{enumerate}
+    \item Most contemporary benchmarks either test image or passage retrieval, with no option for document-level retrieval.
+    \item Current document retrieval pipelines' main bottleneck lies not in the embedding model's performance but in the ingestion stage, i.e. the preprocessing needed to turn a document into suitable input for the model.
+\end{enumerate}
+For each respective problem, the authors propose a solution as follows:
+\begin{enumerate}
+    \item ViDoRe: "a comprehensive benchmark to evaluate systems on page-level document retrieval with a wide coverage of domains, visual elements, and languages."
+    \item ColPali: a new architecture involves using a Vision Language Model (VLM) to quickly index document and a late-interaction mechanism for effective query-matching. 
+\end{enumerate}
+Despite suffering from a notable increase in memory allocation, the architecture significantly outperform competitors in the authors' benchmark.
+
+\section{Formulation:}
+\subsection{Problem setting:}
+The current setting focuses on page-level retrieval, with pages designated as the atomic level of retrieval. Let:
+\begin{itemize}
+\item \(q\) be a text query.
+\item \(\mathcal{D}\) be a collection of document pages.
+\item \(d\in\mathcal{D}\) be one page.
+\item \(s(q,d)\) be the relevance score assigned to that page.
+\end{itemize}
+
+The system ranks pages by decreasing \(s(q,d)\).
+
+Computation has two phases:
+\begin{enumerate}
+    \item Offline indexing: Encode each page and store its vector.
+    \item Online querying: 	Encode the query, score candidate pages, and return the highest-ranked pages.
+\end{enumerate}
+
+\subsection{ColPali Architecture:}
+Disclaimer: I will not go too deep into the background of relevant retrieval techniques and models here; those can be found in the paper. i will instead focus on providing a quick explanation of the proposed architecture.
+
+ColPali is essentially a combination between two existing components:
+\begin{enumerate}
+    \item PaliGemma-3B, a language model, itself a combination of SigLIP (a vision encoder) and Gemma-2B (a language model). SigLIP process each document image and generate a number of patched, represented as vectors, which are then feeded to Gemma-2B to be contextualized into image representations via a connector module.
+    \item Late-interaction scoring mechanism inspired by ColBERT. It is s a neural search architecture that encodes queries and documents independently into multiple token- or patch-level vectors, deferring (hence the "late") fine-grained similarity comparison until search scoring.  
+\end{enumerate}
+
+\paragraph{Encoding} For each image, the main model produces 1,024 patches, in the form of vectors. These vectors are represented by matrix
+\[
+V=
+\begin{bmatrix}
+v_1^\top\\
+\vdots\\
+v_N^\top
+\end{bmatrix}
+\in\mathbb{R}^{1024\times1152},
+\]
+where \(v_i\in\mathbb{R}^{1152}\) represents patch position \(i\). These vectors already contain context from other patches through SigLIP’s self-attention. The connector module, a learned affine projection, maps each patch vector in the required dimension for Gemma. For each $v_i$, it computes:
+\[
+\boxed{z_i=W_cv_i+b_c}
+\]
+with
+\[
+W_c\in\mathbb{R}^{2048\times1152},
+\qquad
+b_c\in\mathbb{R}^{2048},
+\qquad
+z_i\in\mathbb{R}^{2048}.
+\]
+Equivalently, for the entire page:
+\[
+\boxed{
+Z=VW_c^\top+\mathbf{1}_N b_c^\top
+\in\mathbb{R}^{1024\times2048}
+}
+\]
+
+When encoding the image, ColPali feed these vectors followed by six special token positions containing the instruction: "Describe this image."
+
+Gemma then processes this sequence; the output is then projected to 128 dimensions. The resulting document vector is thus:
+\[
+E_d\in\mathbb{R}^{1030\times128},
+\]
+
+\paragraph{Late-interaction scoring} Let the query and document vectors be respectively:
+\[
+E_q=
+\begin{bmatrix}
+\mathbf{q}_1\\
+\vdots\\
+\mathbf{q}_{N_q}
+\end{bmatrix},
+\]
+and 
+\[
+E_d=
+\begin{bmatrix}
+\mathbf{d}_1\\
+\vdots\\
+\mathbf{d}_{1030}
+\end{bmatrix}.
+\]
+
+with 
+\[
+E_q\in\mathbb{R}^{N_q\times128},
+\qquad
+E_d\in\mathbb{R}^{1030\times128},
+\]
+
+where $N_q$ is the number of query token positions.
+
+Next, we calculate the similarity between each query and document vector to form a similarity matrix $S$:
+\[
+S=E_qE_d^\top
+\in\mathbb{R}^{N_q\times N_d}.
+\]
+where 
+\[
+S_{ij}=\mathbf{q}_i^\top\mathbf{d}_j.
+\]
+
+The similarity score $s(q,d)$ is then the sum of maximum similarity between query and document vectors over all query positions:
+\[
+\boxed{
+s(q,d)=
+\sum_{i=1}^{N_q}
+\max_{1\leq j\leq N_d}
+\mathbf{q}_i^\top\mathbf{d}_j
+}
+\]
+Intuitively, late-interaction performs two things: for each page, it first finds the highest similarity score for each query vector, then sum all of them together to get the similarity score for that page.
+
+\paragraph{Training objective} 
+Training requires query–page pairs:
+\[
+\{(q_k,d_k)\}_{k=1}^{b},
+\]
+where:
+- \(b\) is the batch size.
+- \(d_k\) is the correct page for \(q_k\).
+For query \(q_k\), its positive score is:
+\[
+s_k^+=s(q_k,d_k).
+\]
+The other pages in the batch act as negatives. The model selects the highest-scoring incorrect page:
+\[
+s_k^-=
+\max_{\ell\neq k}s(q_k,d_\ell).
+\]
+This is the hardest in-batch negative.
+
+The loss is:
+\[
+\boxed{
+\mathcal{L}
+=
+\frac{1}{b}
+\sum_{k=1}^{b}
+\log\left(1+\exp(s_k^- - s_k^+)\right)
+}
+\]
+Equivalently:
+\[
+\mathcal{L}
+=
+\frac{1}{b}
+\sum_k
+\operatorname{softplus}(s_k^- - s_k^+).
+\]
+Essentially, the models learns to increase the score gap between the top two document with the highest similarity score. If the correct page scores above the incorrect one, the loss is low, and vice versa.
+
+\section{The ViDoRe dataset:}
+ViDoRe contains ten tasks spanning:
+- Scanned documents.
+- Infographics.
+- Scientific figures.
+- Financial reports.
+- Tables.
+- Practical document collections in several domains.
+- English and French.
+Some tasks repurpose visual question-answering data: the question becomes the search query, and its associated page becomes the relevant retrieval target.
+
+Other tasks use collected PDFs and synthetic queries that humans filter for quality.
+
+The main metric is nDCG@5, which measures ranking quality among the first five results. Relevant pages receive more credit when they appear earlier.
+
+A reported score of \(81.3\) corresponds to \(0.813\) on the usual normalized scale. It does not mean 81.3\% answer accuracy.
+
+\section{Training and Results:}
+\subsection{Training configuration:}
+
+ColPali uses 118,695 English query--page pairs from DocVQA, InfoVQA, TAT-DQA, arXivQA, and web-crawled PDFs with Claude-3 Sonnet-generated questions. The authors reserve 2\% for validation and prevent pages from the same PDF from appearing in both training and evaluation. English-only retrieval training allows evaluation of zero-shot transfer to French, although the backbone has encountered multilingual data during pretraining (paper Section~4.2 and Appendix~A.3).
+
+\begingroup
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{0.30\linewidth}p{0.65\linewidth}@{}}
+    \toprule
+    \textbf{Setting} & \textbf{Reference configuration} \\
+    \midrule
+    Training duration & One epoch \\
+    Precision & bfloat16 \\
+    Optimizer & Paged 8-bit AdamW \\
+    Trainable parameters & LoRA adapters in the language-model transformer layers and the randomly initialized output projection \\
+    LoRA parameters & Rank \(r=32\), scaling parameter \(\alpha=32\) \\
+    Output dimension & 128 \\
+    Vision encoder & Frozen \\
+    Hardware setup & Eight GPUs with data parallelism \\
+    Total batch size & 32 query--page pairs \\
+    Per-GPU batch size & Four query--page pairs \\
+    Gradient accumulation & None \\
+    Learning rate & \(5\times10^{-5}\) \\
+    Learning-rate schedule & 2.5\% warmup, followed by linear decay \\
+    Query augmentation & Five appended \texttt{<unused0>} tokens \\
+    \bottomrule
+\end{tabular}
+\endgroup
+
+Source: paper Section~4.2 and Appendix~B.2.
+
+\subsection{Experiment setup:}
+Evaluation covers the ten ViDoRe tasks, primarily using nDCG@5; Recall@1 is additionally reported. Each query ranks candidate pages within its task. The comparison includes three groups (paper Sections~3.2 and~5):
+\begin{itemize}
+    \item \textbf{Text pipelines:} Unstructured with text-only extraction, additional OCR on visual elements, or Claude-3 Sonnet captions. BM25 or BGE-M3 scores the resulting chunks; the maximum chunk score becomes the page score.
+    \item \textbf{Contrastive vision--language models:} Jina-CLIP, Nomic Embed Vision, and pretrained SigLIP encode queries and page images without the full parsing pipeline.
+    \item \textbf{Controlled variants:} BiSigLIP is a fine-tuned single-vector SigLIP retriever; BiPali uses average-pooled PaliGemma outputs; ColPali retains multiple vectors and applies late interaction.
+\end{itemize}
+
+Latency comparisons use an NVIDIA L4 GPU on a GCP \texttt{g2-standard-8} VM. Appendix~B.4 reports average indexing times over 1,000 randomly selected benchmark pages, using batch size four for ColPali and SigLIP and eight for BGE-M3. Online query encoding uses batch size one, averaged over 1,000 queries. These conditions matter when comparing the published timings with another machine or implementation.
+
+\subsection{Result analysis:}
+Table~\ref{tab:main-results} condenses the averages from the paper's Table~2. Scores use the paper's 0--100 presentation of nDCG@5, averaged across ten tasks.
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{lr}
+        \toprule
+        Method & Average nDCG@5 \\
+        \midrule
+        Unstructured + OCR + BGE-M3 & 66.1 \\
+        Unstructured + captioning + BGE-M3 & 67.0 \\
+        SigLIP (pretrained) & 51.4 \\
+        BiSigLIP (fine-tuned) & 58.6 \\
+        BiPali (single vector) & 58.8 \\
+        ColPali (late interaction) & \textbf{81.3} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Selected published ViDoRe results (paper Table~2).}
+    \label{tab:main-results}
+\end{table}
+
+ColPali exceeds the strongest evaluated parsing baseline by 14.3 points and BiPali by 22.5 points. Fine-tuning SigLIP helps, but adding a language model while retaining a single pooled vector yields little average improvement. The large gain appears when the model preserves patch representations and uses late interaction, supporting the argument that a single vector loses useful information from visually rich pages.
+
+ColPali scores 79.1 on arXivQA, 81.8 on InfoVQA, and 83.9 on TabFQuAD, demonstrating strong retrieval of figures, infographics, and tables. It also performs strongly on practical tasks, including AI (96.2) and healthcare (94.4). Overall Recall@1 is 72.7, so the relevant page still fails to rank first for a substantial share of queries (paper Tables~2 and~6).
+
+The main speed advantage is in ingestion. Appendix~B.4 reports 0.39 seconds per page for ColPali versus 7.22 seconds for the full Unstructured pipeline with captioning, approximately an 18.5-fold speedup under those conditions. Online encoding takes about 30\,ms for ColPali versus 22\,ms for BGE-M3 on a 15-token query; late interaction adds approximately 1\,ms per 1,000 candidate pages in the small-corpus setting (paper Section~5.2). Faster indexing therefore comes with somewhat higher online computation and larger stored representations.
+
+
+\section{Limitations and Ablation study:}
+\subsection{Limitations:}
+\begin{itemize}
+    \item \textbf{Index size:} The uncompressed float16 representation stores 1,030 vectors of dimension 128, requiring 257.5\,KB per page. Appendix~B.3 reports 8.60\,KB for BGE-M3 on DocVQA, making ColPali roughly 30 times larger in this comparison. Pooling and quantization offer a quality--compression trade-off.
+    \item \textbf{Scaling:} Query encoding requires a language model, and exhaustive late-interaction scoring grows with corpus size. The small-corpus timing does not establish equivalent latency at millions of pages; that requires an appropriate retrieval engine and index (paper Section~5.2).
+    \item \textbf{Evaluation coverage:} The original benchmark covers English and French, with 210--1,600 candidate pages per task. Academic tasks reuse visual QA data, and practical queries are VLM-generated and human-filtered. Broader languages and naturally occurring, large-scale search traffic need further evaluation (paper Section~3 and Table~1).
+    \item \textbf{Comparison and task boundaries:} ColPali receives task-oriented fine-tuning, whereas BGE-M3 is not trained on the same extracted pages. The out-of-domain ablation partly addresses this concern. Page retrieval also does not by itself establish multi-page reasoning, answer correctness, or end-to-end RAG reliability (paper Sections~6--7).
+\end{itemize}
+
+\subsection{Ablation study:}
+The following averages follow Appendix~C.2, Table~7, with reference ColPali at 81.3. Some descriptions in Section~6 differ from the table; the table values are used consistently here.
+\begin{itemize}
+    \item \textbf{Resolution and backbone:} The low-resolution \texttt{ColPali (224)} variant reaches only 56.5. The prose describes the reduced patch count inconsistently, so the reliable conclusion is that reducing visual detail substantially harms retrieval. ColIdefics2 with 64 resampled image tokens reaches 76.6 but is about twice as slow in training and inference. ColQwen2 with at most 768 patches reaches 86.6, demonstrating the importance of backbone quality.
+    \item \textbf{Vision encoder:} Updating the vision component gives 80.6, down 0.7 points. Unfreezing it does not improve retrieval under this training configuration.
+    \item \textbf{Query augmentation:} Removing augmentation tokens gives 79.6 overall. The reference model with augmentation scores 73.2 versus 63.4 on Shift and 83.9 versus 77.4 on TabFQuAD, showing particular benefits on French tasks. These table entries clarify the ambiguous wording in Section~6.
+    \item \textbf{Loss function:} Using all in-batch negatives rather than only the hardest negative gives 79.7, down 1.6 points. The pairwise objective is slightly better in this experiment.
+    \item \textbf{Adaptation and generalization:} Adding 1,552 French table examples raises TabFQuAD from 83.9 to 86.5 and the overall average to 81.7. Training on a comparably sized DocMatix subset instead gives 79.1, suggesting useful generalization beyond the original training distribution.
+\end{itemize}
+
+Token pooling provides a separate storage ablation: a pooling factor of three removes 66.7\% of stored vectors while retaining 97.8\% of the original retrieval performance. Dense-text Shift pages degrade more, suggesting fewer redundant patches can safely be pooled there (paper Section~5.2 and Figure~3).
+
+\section{Dataset and code resources:}
+\begin{itemize}
+    \item \textbf{Paper:} Manuel Faysse et al., \emph{ColPali: Efficient Document Retrieval with Vision Language Models}, ICLR 2025, arXiv:2407.01449v6.\\
+    \url{https://arxiv.org/abs/2407.01449v6}
+    \item \textbf{Training data:} Released ColPali query--page pairs.\\
+    \url{https://huggingface.co/datasets/vidore/colpali_train_set}
+    \item \textbf{Evaluation data:} Original ten-task ViDoRe collection, distinct from the later ViDoRe v2 and v3 benchmarks.\\
+    \url{https://huggingface.co/collections/vidore/vidore-benchmark}
+    \item \textbf{Training and inference code:} Official ColPali repository and \texttt{colpali-engine} package. The README recommends tag \texttt{v0.1.1} or package version \texttt{0.1.1} for paper-result reproduction.\\
+    \url{https://github.com/illuin-tech/colpali}
+    \item \textbf{Evaluation code:} Official \texttt{vidore-benchmark} repository.\\
+    \url{https://github.com/illuin-tech/vidore-benchmark}
+\end{itemize}
+
+\end{document}
